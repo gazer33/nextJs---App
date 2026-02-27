@@ -439,6 +439,214 @@ When starting Phase 2, implement in this order:
 
 ---
 
+## Phase 2 - Scalability (IN PROGRESS)
+
+### Slice 1: Architecture Foundation + Tooling (COMPLETE)
+
+**Implemented:**
+
+1. **Repository Hygiene**
+   - Stricter TypeScript config (`noUnusedLocals`, `noUnusedParameters`, `noFallthroughCasesInSwitch`)
+   - Enhanced ESLint rules (consistent type imports, no-console warnings)
+   - Enforced casing consistency
+
+2. **Directory Structure**
+   ```
+   src/
+   ├── lib/              # Cross-cutting utilities (client-safe)
+   │   ├── env.ts        # Environment validation (server-only)
+   │   ├── logger.ts     # Logging utilities
+   │   ├── errors.ts     # Standardized error types
+   │   └── utils.ts      # Existing utilities
+   ├── server/           # Server-only code
+   │   ├── actions/      # Next.js Server Actions
+   │   │   └── README.md # Action conventions
+   │   └── utils/
+   │       └── action-wrapper.ts  # Error handling wrapper
+   ├── components/       # React components
+   ├── app/             # Next.js App Router
+   └── styles/          # Global styles
+   ```
+
+3. **Server/Client Boundaries**
+   - `/src/server` is strictly server-only (enforced with `'server-only'` package)
+   - `/src/lib/env.ts` can only be imported in server contexts
+   - Client components must use server actions for mutations
+   - Server Components can directly access server utilities
+
+4. **Environment Validation**
+   - Zod schema validates all environment variables at startup
+   - Type-safe `env` export for server-side use
+   - `.env.example` documents required variables
+   - Singleton pattern prevents re-validation overhead
+
+   **Required env vars:**
+   - `DATABASE_URL` - Prisma connection string
+   - `SESSION_SECRET` - Session encryption key (min 32 chars)
+   - `SESSION_MAX_AGE` - Session duration in seconds
+   - `NODE_ENV` - Environment (development/production/test)
+   - `NEXT_PUBLIC_APP_URL` - App base URL
+   - `BCRYPT_ROUNDS` - Password hashing rounds (10-15)
+   - `RATE_LIMIT_MAX` - Max requests per window
+   - `RATE_LIMIT_WINDOW_MS` - Rate limit window in ms
+
+5. **Error Handling**
+
+   **Error Classes:**
+   ```typescript
+   - AppError            // Base error (500)
+   - ValidationError     // Invalid input (400)
+   - AuthenticationError // Not authenticated (401)
+   - AuthorizationError  // No permission (403)
+   - NotFoundError       // Resource not found (404)
+   - RateLimitError      // Too many requests (429)
+   ```
+
+   **Action Result Pattern:**
+   ```typescript
+   type ActionResult<T> =
+     | { success: true; data: T }
+     | { success: false; error: { message: string; code?: string; field?: string } }
+   ```
+
+   **Usage:**
+   ```typescript
+   const result = await createProject({ name: 'My Project' })
+
+   if (!result.success) {
+     // Handle error: result.error.message
+     return
+   }
+
+   // Use data: result.data.id
+   ```
+
+6. **Logging Strategy**
+   - Structured logging with timestamp, level, context
+   - Debug logs only in development
+   - Error logs include stack traces
+   - Production-ready format for log aggregation
+   - No PII in logs (will be enforced in auth slice)
+
+7. **Server Action Conventions** (see `/src/server/actions/README.md`)
+   - One file per action
+   - Domain-based folders (auth, projects, tasks)
+   - Always use `actionWrapper` for error handling
+   - Always validate with Zod schemas
+   - Log security events
+
+### Architecture Decisions
+
+#### Why `server-only` Package?
+
+The `server-only` package ensures code in `/src/server` never gets bundled for the client. If client code tries to import it, builds fail immediately.
+
+```bash
+npm install server-only
+```
+
+Usage:
+```typescript
+// src/server/db.ts
+import 'server-only'
+// ... database code
+```
+
+#### Why Singleton Env Pattern?
+
+Environment validation happens once at module load. Subsequent imports get cached results. This prevents:
+- Re-validation overhead on every request
+- Inconsistent env state during runtime
+
+#### Why Action Wrapper?
+
+The `actionWrapper` utility provides:
+- **Consistent error handling** - All errors convert to `ActionResult`
+- **Logging** - Every action logs success/failure
+- **Type safety** - Input/output types are enforced
+- **DRY** - No try/catch boilerplate in every action
+
+#### Error Handling Philosophy
+
+1. **Explicit over implicit** - Use typed error classes
+2. **Client-safe errors** - Never leak stack traces to client
+3. **Structured responses** - Always return `ActionResult`
+4. **Logging first** - Log before returning error
+5. **Fail fast** - Validate early, crash loudly in dev
+
+### How to Extend (Future Slices)
+
+#### Slice 2: Adding Database Access
+
+```typescript
+// src/server/db.ts
+import 'server-only'
+import { PrismaClient } from '@prisma/client'
+import { env } from '@/lib/env'
+
+const prisma = new PrismaClient({
+  datasources: { db: { url: env.DATABASE_URL } },
+})
+
+export { prisma }
+```
+
+#### Slice 3: Adding Authentication
+
+```typescript
+// src/server/actions/auth/login.ts
+'use server'
+
+import { actionWrapper } from '@/server/utils/action-wrapper'
+import { AuthenticationError } from '@/lib/errors'
+import { prisma } from '@/server/db'
+
+export const login = actionWrapper(async (input) => {
+  const user = await prisma.user.findUnique({ where: { email: input.email } })
+
+  if (!user) {
+    throw new AuthenticationError('Invalid credentials')
+  }
+
+  // ... verify password, create session
+
+  return { userId: user.id }
+})
+```
+
+#### Slice 4: Adding CRUD Actions
+
+```typescript
+// src/server/actions/projects/create-project.ts
+'use server'
+
+import { actionWrapper } from '@/server/utils/action-wrapper'
+import { z } from 'zod'
+import { prisma } from '@/server/db'
+import { requireAuth } from '@/server/utils/auth'
+
+const schema = z.object({
+  name: z.string().min(1).max(100),
+  description: z.string().max(500).optional(),
+})
+
+export const createProject = actionWrapper(async (input) => {
+  const userId = await requireAuth() // Throws if not authenticated
+  const validated = schema.parse(input)
+
+  const project = await prisma.project.create({
+    data: {
+      ...validated,
+      userId,
+    },
+  })
+
+  return project
+})
+```
+
+---
+
 ## Conclusion
 
 Phase 1 provides a solid, production-ready UI foundation with:
@@ -449,6 +657,13 @@ Phase 1 provides a solid, production-ready UI foundation with:
 - ✅ Dark mode support
 - ✅ Excellent developer experience (TypeScript, ESLint, Prettier)
 
-Phase 2 will layer on backend functionality without disrupting the existing structure. The architecture is designed to scale incrementally, maintaining code quality and user experience throughout.
+Phase 2 Slice 1 adds the architectural foundation for scalability:
 
-**Ready for Phase 2!**
+- ✅ Environment validation with Zod
+- ✅ Server/client boundary enforcement
+- ✅ Standardized error handling
+- ✅ Logging infrastructure
+- ✅ Server action conventions
+- ✅ Ready for database, auth, and CRUD
+
+**Ready for Phase 2 Slice 2!**
