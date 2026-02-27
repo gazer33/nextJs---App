@@ -666,4 +666,245 @@ Phase 2 Slice 1 adds the architectural foundation for scalability:
 - ✅ Server action conventions
 - ✅ Ready for database, auth, and CRUD
 
-**Ready for Phase 2 Slice 2!**
+---
+
+### Slice 2: Prisma + SQLite + Migrations + Seed (COMPLETE)
+
+**Implemented:**
+
+1. **Prisma Setup**
+   - Installed `prisma@^5.9.0` (dev) and `@prisma/client@^5.9.0` (prod)
+   - Installed `tsx@^4.7.0` for running TypeScript seed files
+   - Configured SQLite provider in `prisma/schema.prisma`
+   - Added `postinstall` hook to auto-generate Prisma Client
+
+2. **Database Schema**
+
+   **Models:**
+   - `User` - Authentication (id, email, passwordHash, name, timestamps)
+   - `Session` - Session storage (id, userId, token, expiresAt)
+   - `Project` - Projects (id, name, description, status, userId, timestamps)
+   - `Task` - Tasks (id, projectId, title, description, status, priority, dueDate, timestamps)
+
+   **Enums:**
+   - `ProjectStatus` - PLANNING, ACTIVE, COMPLETED, ARCHIVED
+   - `TaskStatus` - TODO, IN_PROGRESS, DONE
+   - `TaskPriority` - LOW, MEDIUM, HIGH
+
+   **Relations:**
+   - User → Projects (one-to-many)
+   - User → Sessions (one-to-many)
+   - Project → Tasks (one-to-many)
+   - Cascade deletes on user/project deletion
+
+   **Indexes:**
+   - `userId` on projects, sessions
+   - `token` on sessions
+   - `projectId` on tasks
+   - `status` on projects and tasks
+   - `priority` on tasks
+
+3. **Database Client (`src/server/db.ts`)**
+   - Singleton pattern to prevent connection exhaustion
+   - Global instance in development (hot reload safe)
+   - Fresh instance in production
+   - Logging: query/error/warn in dev, error-only in prod
+   - Auto-connect on first query with logging
+   - `disconnectDatabase()` helper for cleanup
+
+4. **Seed Script (`prisma/seed.ts`)**
+   - Creates 1 demo user (email: demo@example.com)
+   - Creates 3 sample projects (ACTIVE, PLANNING, COMPLETED)
+   - Creates 10 tasks across projects with variety:
+     - Different statuses (TODO, IN_PROGRESS, DONE)
+     - Different priorities (LOW, MEDIUM, HIGH)
+     - Some with due dates
+   - Clears existing data before seeding (safe for dev)
+   - Summary output with counts
+
+5. **Package Scripts**
+   ```json
+   "db:migrate"   - Run migrations (development)
+   "db:generate"  - Generate Prisma Client
+   "db:seed"      - Seed database with demo data
+   "db:studio"    - Open Prisma Studio (GUI)
+   "db:reset"     - Reset database (drops + migrates + seeds)
+   "db:push"      - Push schema without migration (prototyping)
+   "postinstall"  - Auto-generate client after npm install
+   ```
+
+6. **Git Ignore**
+   - Added `/prisma/*.db` (SQLite database files)
+   - Added `/prisma/*.db-journal` (SQLite journal files)
+
+### Database Conventions
+
+#### Query Patterns
+
+**Always use transactions for multi-step operations:**
+```typescript
+await prisma.$transaction(async (tx) => {
+  const project = await tx.project.create({ data: {...} })
+  await tx.task.createMany({ data: [...] })
+  return project
+})
+```
+
+**Use `select` to optimize queries:**
+```typescript
+// Good - only fetch needed fields
+await prisma.project.findMany({
+  select: { id: true, name: true },
+})
+
+// Avoid - fetches all fields
+await prisma.project.findMany()
+```
+
+**Use `include` for relations:**
+```typescript
+await prisma.project.findUnique({
+  where: { id },
+  include: { tasks: true },
+})
+```
+
+#### Error Handling
+
+Prisma errors should be caught and converted to `AppError`:
+
+```typescript
+import { NotFoundError } from '@/lib/errors'
+import { Prisma } from '@prisma/client'
+
+try {
+  const project = await prisma.project.findUniqueOrThrow({ where: { id } })
+} catch (error) {
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (error.code === 'P2025') {
+      throw new NotFoundError('Project')
+    }
+  }
+  throw error
+}
+```
+
+**Common Prisma error codes:**
+- `P2002` - Unique constraint violation
+- `P2025` - Record not found
+- `P2003` - Foreign key constraint violation
+
+#### Migrations Workflow
+
+**Development:**
+```bash
+# Create migration from schema changes
+npm run db:migrate
+
+# Push schema without migration (prototyping)
+npm run db:push
+
+# Reset database (drop + migrate + seed)
+npm run db:reset
+```
+
+**Production:**
+```bash
+# Apply pending migrations
+npx prisma migrate deploy
+
+# DO NOT use db:push in production
+```
+
+#### Seeding Strategy
+
+- Seed script is idempotent (clears data first)
+- Only runs in development (not production)
+- Can be run manually: `npm run db:seed`
+- Auto-runs after `npm run db:reset`
+- Creates realistic demo data for testing UI
+
+### How to Extend (Future Slices)
+
+#### Slice 3: Adding Authentication Queries
+
+```typescript
+// src/server/repositories/user.ts
+import 'server-only'
+import { prisma } from '@/server/db'
+import bcrypt from 'bcryptjs'
+
+export async function createUser(email: string, password: string, name?: string) {
+  const passwordHash = await bcrypt.hash(password, env.BCRYPT_ROUNDS)
+
+  return prisma.user.create({
+    data: { email, passwordHash, name },
+  })
+}
+
+export async function verifyPassword(user: { passwordHash: string }, password: string) {
+  return bcrypt.compare(password, user.passwordHash)
+}
+```
+
+#### Slice 4: Adding Project CRUD
+
+```typescript
+// src/server/actions/projects/get-projects.ts
+'use server'
+
+import { actionWrapper } from '@/server/utils/action-wrapper'
+import { prisma } from '@/server/db'
+import { requireAuth } from '@/server/utils/auth'
+
+export const getProjects = actionWrapper(async () => {
+  const userId = await requireAuth()
+
+  const projects = await prisma.project.findMany({
+    where: { userId },
+    include: {
+      tasks: {
+        select: { id: true, status: true },
+      },
+    },
+    orderBy: { updatedAt: 'desc' },
+  })
+
+  return projects.map(project => ({
+    ...project,
+    taskCount: project.tasks.length,
+    completedCount: project.tasks.filter(t => t.status === 'DONE').length,
+  }))
+})
+```
+
+---
+
+## Conclusion
+
+Phase 1 provides a solid, production-ready UI foundation with:
+
+- ✅ Modern Next.js architecture
+- ✅ Comprehensive component library
+- ✅ Accessible, responsive design
+- ✅ Dark mode support
+- ✅ Excellent developer experience (TypeScript, ESLint, Prettier)
+
+Phase 2 Slice 1 adds the architectural foundation:
+
+- ✅ Environment validation with Zod
+- ✅ Server/client boundary enforcement
+- ✅ Standardized error handling
+- ✅ Logging infrastructure
+- ✅ Server action conventions
+
+Phase 2 Slice 2 adds the database layer:
+
+- ✅ Prisma ORM with SQLite
+- ✅ Type-safe database schema (User, Project, Task, Session)
+- ✅ Migration system
+- ✅ Seed script with demo data
+- ✅ Database client singleton
+- ✅ Ready for authentication and CRUD
+
+**Ready for Phase 2 Slice 3!**
